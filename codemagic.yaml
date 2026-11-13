@@ -3,6 +3,57 @@ workflows:
     name: Build Unsigned IPA
     max_build_duration: 20
     scripts:
+      - name: Ensure Assets.xcassets exists
+        script: |
+          python3 - <<'PY'
+          import json, struct, zlib
+          from pathlib import Path
+
+          base = Path("Teleprompter/Resources/Assets.xcassets")
+          appicon = base / "AppIcon.appiconset"
+          accent = base / "AccentColor.colorset"
+          appicon.mkdir(parents=True, exist_ok=True)
+          accent.mkdir(parents=True, exist_ok=True)
+
+          (base / "Contents.json").write_text(json.dumps({"info": {"author": "xcode", "version": 1}}, indent=2))
+          (accent / "Contents.json").write_text(json.dumps({
+              "colors": [{"color": {"color-space": "srgb", "components": {"alpha": "1.000", "blue": "0.180", "green": "0.560", "red": "1.000"}}, "idiom": "universal"}],
+              "info": {"author": "xcode", "version": 1}
+          }, indent=2))
+          (appicon / "Contents.json").write_text(json.dumps({
+              "images": [{"filename": "AppIcon.png", "idiom": "universal", "platform": "ios", "size": "1024x1024"}],
+              "info": {"author": "xcode", "version": 1}
+          }, indent=2))
+
+          icon_file = appicon / "AppIcon.png"
+          if not icon_file.exists():
+              w = h = 1024
+              raw = bytearray()
+              cx = cy = 512.0
+              for y in range(h):
+                  raw.append(0)
+                  for x in range(w):
+                      dx, dy = abs(x - cx), abs(y - cy)
+                      if dx < 280 and dy < 220:
+                          if dy <= 25 and dx < 220:
+                              raw.extend((255, 255, 255, 255))
+                          elif 130 < dy < 155 and dx < 200:
+                              raw.extend((20, 20, 24, 255))
+                          else:
+                              raw.extend((255, 143, 46, 255))
+                      else:
+                          raw.extend((20, 20, 24, 255))
+              def chunk(tag, data):
+                  return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xffffffff)
+              ihdr = struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)
+              icon_file.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
+
+          gen = Path("Tools/generate_project.py")
+          text = gen.read_text(encoding="utf-8")
+          text = text.replace('"path": "Assets.xcassets",\n    "sourceTree": "<group>"', '"path": "Teleprompter/Resources/Assets.xcassets",\n    "sourceTree": "SOURCE_ROOT"')
+          gen.write_text(text, encoding="utf-8")
+          print("Assets.xcassets ready")
+          PY
       - name: Regenerate Xcode project
         script: python3 Tools/generate_project.py
       - name: Build unsigned IPA
