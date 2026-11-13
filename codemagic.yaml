@@ -1,0 +1,11 @@
+workflows:
+  ios-unsigned-ipa:
+    name: Build Unsigned IPA
+    max_build_duration: 20
+    scripts:
+      - name: Regenerate Xcode project
+        script: python3 Tools/generate_project.py
+      - name: Build unsigned IPA
+        script: bash Tools/build_unsigned_ipa.sh
+    artifacts:
+      - Teleprompter-unsigned.ipa
