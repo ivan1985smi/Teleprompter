@@ -1,6 +1,16 @@
 import SwiftUI
 import UIKit
 import Combine
+import Speech
+import AVFoundation
+
+private struct PrompterVoiceAnchor {
+    let index: Int
+    let normalizedWord: String
+    let stem: String
+    let charRange: NSRange
+    let targetScrollY: CGFloat
+}
 
 final class PrompterContainerView: UIView {
     let textView: UITextView
@@ -41,15 +51,15 @@ final class PrompterContainerView: UIView {
     }
 
     private func setupVoicePillButton() {
-        voicePillButton.backgroundColor = UIColor(white: 0.14, alpha: 0.86)
+        voicePillButton.backgroundColor = UIColor(white: 0.14, alpha: 0.88)
         voicePillButton.layer.cornerRadius = 17
         voicePillButton.layer.cornerCurve = .continuous
         voicePillButton.layer.borderWidth = 1
-        voicePillButton.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+        voicePillButton.layer.borderColor = UIColor.white.withAlphaComponent(0.20).cgColor
         voicePillButton.tintColor = .white
         voicePillButton.setTitleColor(.white, for: .normal)
         voicePillButton.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
-        voicePillButton.contentEdgeInsets = UIEdgeInsets(top: 7, left: 13, bottom: 7, right: 13)
+        voicePillButton.titleLabel?.lineBreakMode = .byTruncatingTail
         voicePillButton.setTitle("🎙 Голос: Выкл", for: .normal)
         voicePillButton.addTarget(self, action: #selector(handleVoiceButtonTap), for: .touchUpInside)
         addSubview(voicePillButton)
@@ -64,12 +74,12 @@ final class PrompterContainerView: UIView {
         voicePillButton.setTitle(title, for: .normal)
 
         if active {
-            let pulseAlpha = CGFloat(0.28 + min(max(level, 0), 1) * 0.42)
+            let pulseAlpha = CGFloat(0.30 + min(max(level, 0), 1) * 0.45)
             voicePillButton.backgroundColor = UIColor.systemOrange.withAlphaComponent(pulseAlpha)
             voicePillButton.layer.borderColor = UIColor.systemOrange.cgColor
         } else {
-            voicePillButton.backgroundColor = UIColor(white: 0.14, alpha: 0.86)
-            voicePillButton.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+            voicePillButton.backgroundColor = UIColor(white: 0.14, alpha: 0.88)
+            voicePillButton.layer.borderColor = UIColor.white.withAlphaComponent(0.20).cgColor
         }
         setNeedsLayout()
     }
@@ -85,12 +95,11 @@ final class PrompterContainerView: UIView {
             textView.frame = bounds
         }
 
-        voicePillButton.sizeToFit()
-        let pillWidth = min(max(voicePillButton.bounds.width, 136), bounds.width - 32)
+        let labelWidth = voicePillButton.titleLabel?.intrinsicContentSize.width ?? 110
+        let pillWidth = min(max(labelWidth + 28, 138), max(138, bounds.width - 32))
         let pillHeight: CGFloat = 34
         let rightMargin = max(16, safeAreaInsets.right + 12)
         let topY = safeAreaInsets.top + 64
-        // Если контейнер отзеркален, размещаем кнопку у противоположного края, чтобы на экране она всегда была справа
         let isMirrored = transform.a < 0
         let pillX = isMirrored ? rightMargin : (bounds.width - pillWidth - rightMargin)
         voicePillButton.frame = CGRect(x: pillX, y: topY, width: pillWidth, height: pillHeight)
@@ -138,10 +147,9 @@ struct PrompterScrollView: UIViewRepresentable {
             coordinator?.recalculateLayoutMetrics()
         }
         container.onToggleVoiceFollow = { [weak coordinator] in
-            coordinator?.engine.toggleVoiceFollow()
+            coordinator?.toggleVoiceFollow()
         }
 
-        coordinator.bindVoiceUpdates()
         coordinator.apply(text: text, settings: settings, force: true)
         engine.attach(coordinator)
         return container
@@ -159,7 +167,7 @@ struct PrompterScrollView: UIViewRepresentable {
         container.onLayoutMetricsChanged = nil
         container.onToggleVoiceFollow = nil
         container.textView.delegate = nil
-        coordinator.cancellables.removeAll()
+        coordinator.stopVoiceFollow()
         coordinator.engine.detach(coordinator)
     }
 
@@ -171,24 +179,39 @@ struct PrompterScrollView: UIViewRepresentable {
         private var lastText: String = ""
         private var lastSettings: PrompterSettings?
         private var isProgrammaticScroll: Bool = false
-        var cancellables = Set<AnyCancellable>()
+        private var isInternalVoiceSeek: Bool = false
+
+        // MARK: - Голосовой автоскролл (Voice-Follow)
+        private var isVoiceFollowActive: Bool = false
+        private var voiceStatusText: String = "Голос: Выкл"
+        private var voiceAudioLevel: Float = 0
+
+        private var voiceAnchors: [PrompterVoiceAnchor] = []
+        private var currentAnchorIndex: Int = 0
+        private var currentScrollY: CGFloat = 0
+        private var voiceTargetY: CGFloat = 0
+        private var maxScrollY: CGFloat = 1
+        private var viewportHeight: CGFloat = 600
+
+        private let audioEngine = AVAudioEngine()
+        private var speechRecognizer: SFSpeechRecognizer? = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
+        private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+        private var recognitionTask: SFSpeechRecognitionTask?
+        private var voiceDisplayLink: CADisplayLink?
+        private var lastFrameTimestamp: CFTimeInterval?
+
+        private var lastVoiceActivityTime: CFTimeInterval = 0
+        private var lastWordMatchTime: CFTimeInterval = 0
+        private var sessionStartTime: CFTimeInterval = 0
+        private var isRestartingSession: Bool = false
 
         init(engine: ScrollEngine) {
             self.engine = engine
+            super.init()
         }
 
-        func bindVoiceUpdates() {
-            cancellables.removeAll()
-            Publishers.CombineLatest3(
-                engine.$isVoiceFollowActive,
-                engine.$voiceStatusText,
-                engine.$voiceAudioLevel
-            )
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] active, status, level in
-                self?.containerView?.updateVoicePillState(active: active, statusText: status, level: level)
-            }
-            .store(in: &cancellables)
+        deinit {
+            stopVoiceFollow()
         }
 
         func apply(text: String, settings: PrompterSettings, force: Bool) {
@@ -280,6 +303,9 @@ struct PrompterScrollView: UIViewRepresentable {
             let totalContentHeight = ceil(usedRect.height + targetContainerInset.top + targetContainerInset.bottom)
             let maxScroll = max(1, totalContentHeight - bounds.height)
 
+            self.maxScrollY = maxScroll
+            self.viewportHeight = bounds.height
+
             engine.updateMetrics(maxPosition: maxScroll, viewportHeight: bounds.height)
             rebuildVoiceWordAnchors(in: textView, maxScroll: maxScroll)
         }
@@ -287,11 +313,12 @@ struct PrompterScrollView: UIViewRepresentable {
         private func rebuildVoiceWordAnchors(in textView: UITextView, maxScroll: CGFloat) {
             let nsString = (textView.text ?? "") as NSString
             guard nsString.length > 0 else {
-                engine.updateVoiceAnchors([])
+                voiceAnchors = []
+                currentAnchorIndex = 0
                 return
             }
 
-            var anchors: [VoiceWordAnchor] = []
+            var anchors: [PrompterVoiceAnchor] = []
             let layoutManager = textView.layoutManager
             let textContainer = textView.textContainer
 
@@ -300,44 +327,52 @@ struct PrompterScrollView: UIViewRepresentable {
                 options: [.byWords]
             ) { substring, wordRange, _, _ in
                 guard let substring else { return }
-                let norm = ScrollEngine.normalizeRussianWord(substring)
+                let norm = Self.normalizeRussianWord(substring)
                 guard !norm.isEmpty else { return }
 
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: wordRange, actualCharacterRange: nil)
                 let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
                 let targetY = min(max(0, rect.minY), maxScroll)
 
-                let anchor = VoiceWordAnchor(
+                let anchor = PrompterVoiceAnchor(
                     index: anchors.count,
                     normalizedWord: norm,
-                    stem: ScrollEngine.russianStem(for: norm),
+                    stem: Self.russianStem(for: norm),
                     charRange: wordRange,
                     targetScrollY: targetY
                 )
                 anchors.append(anchor)
             }
 
-            engine.updateVoiceAnchors(anchors)
+            voiceAnchors = anchors
+            syncAnchorIndex(toScrollY: currentScrollY)
         }
 
         func displayScrollPosition(_ position: CGFloat) {
             guard let textView else { return }
             isProgrammaticScroll = true
             let clampedY = max(0, position)
+            currentScrollY = clampedY
             if abs(textView.contentOffset.y - clampedY) > 0.05 {
                 textView.contentOffset = CGPoint(x: 0, y: clampedY)
                 textView.setNeedsDisplay()
             }
             isProgrammaticScroll = false
+
+            // Если позицию сместили пультом или ползунком — синхронизируем голосовой прицел
+            if isVoiceFollowActive && !isInternalVoiceSeek {
+                voiceTargetY = clampedY
+                syncAnchorIndex(toScrollY: clampedY)
+            }
         }
 
         func setManualScrollingEnabled(_ enabled: Bool) {
             textView?.isScrollEnabled = true
-            textView?.panGestureRecognizer.isEnabled = enabled || engine.isVoiceFollowActive
+            textView?.panGestureRecognizer.isEnabled = enabled || isVoiceFollowActive
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-            if engine.isPlaying && !engine.isVoiceFollowActive {
+            if engine.isPlaying {
                 engine.pause()
             }
         }
@@ -345,7 +380,453 @@ struct PrompterScrollView: UIViewRepresentable {
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
             guard !isProgrammaticScroll,
                   scrollView.isDragging || scrollView.isDecelerating else { return }
-            engine.updateFromManualScroll(scrollView.contentOffset.y)
+            let offsetY = max(0, scrollView.contentOffset.y)
+            currentScrollY = offsetY
+            if isVoiceFollowActive {
+                voiceTargetY = offsetY
+                syncAnchorIndex(toScrollY: offsetY)
+            }
+            engine.updateFromManualScroll(offsetY)
+        }
+
+        // MARK: - Запуск и остановка голосового режима
+
+        func toggleVoiceFollow() {
+            if isVoiceFollowActive {
+                stopVoiceFollow()
+            } else {
+                startVoiceFollow()
+            }
+        }
+
+        private func refreshPillUI() {
+            containerView?.updateVoicePillState(
+                active: isVoiceFollowActive,
+                statusText: voiceStatusText,
+                level: voiceAudioLevel
+            )
+        }
+
+        func startVoiceFollow() {
+            guard !isVoiceFollowActive else { return }
+            if engine.isPlaying {
+                engine.pause()
+            }
+            voiceStatusText = "Проверка..."
+            refreshPillUI()
+
+            SFSpeechRecognizer.requestAuthorization { [weak self] authStatus in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard authStatus == .authorized else {
+                        self.voiceStatusText = "Нет доступа к речи"
+                        self.isVoiceFollowActive = false
+                        self.refreshPillUI()
+                        return
+                    }
+                    self.requestMicrophoneAndStart()
+                }
+            }
+        }
+
+        private func requestMicrophoneAndStart() {
+            let completion: (Bool) -> Void = { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard granted else {
+                        self.voiceStatusText = "Микрофон запрещён"
+                        self.isVoiceFollowActive = false
+                        self.refreshPillUI()
+                        return
+                    }
+                    self.launchVoiceSession()
+                }
+            }
+
+            if #available(iOS 17.0, *) {
+                AVAudioApplication.requestRecordPermission(completionHandler: completion)
+            } else {
+                AVAudioSession.sharedInstance().requestRecordPermission(completion)
+            }
+        }
+
+        private func launchVoiceSession() {
+            stopAudioPipelinesOnly()
+
+            if maxScrollY > 1 && currentScrollY >= maxScrollY - 2 {
+                isInternalVoiceSeek = true
+                engine.seek(to: CGFloat(0))
+                isInternalVoiceSeek = false
+                currentScrollY = 0
+                voiceTargetY = 0
+                currentAnchorIndex = 0
+            } else {
+                voiceTargetY = currentScrollY
+                syncAnchorIndex(toScrollY: currentScrollY)
+            }
+
+            do {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(
+                    .playAndRecord,
+                    mode: .measurement,
+                    options: [.defaultToSpeaker, .mixWithOthers]
+                )
+                try session.setActive(true, options: .notifyOthersOnDeactivation)
+
+                if speechRecognizer == nil {
+                    speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
+                }
+
+                let inputNode = audioEngine.inputNode
+                let format = inputNode.outputFormat(forBus: 0)
+                inputNode.removeTap(onBus: 0)
+                inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                    guard let self else { return }
+                    self.recognitionRequest?.append(buffer)
+                    self.analyzeMicrophoneBuffer(buffer)
+                }
+
+                audioEngine.prepare()
+                try audioEngine.start()
+
+                startRecognitionTask()
+                startVoiceDisplayLink()
+
+                isVoiceFollowActive = true
+                textView?.panGestureRecognizer.isEnabled = true
+                voiceStatusText = "Слушаю речь..."
+                refreshPillUI()
+            } catch {
+                voiceStatusText = "Ошибка микрофона"
+                isVoiceFollowActive = false
+                refreshPillUI()
+            }
+        }
+
+        private func startRecognitionTask() {
+            recognitionTask?.cancel()
+            recognitionTask = nil
+
+            let request = SFSpeechAudioBufferRecognitionRequest()
+            request.shouldReportPartialResults = true
+            request.taskHint = .dictation
+            self.recognitionRequest = request
+            self.sessionStartTime = CACurrentMediaTime()
+
+            recognitionTask = speechRecognizer?.recognitionTask(with: request) { [weak self] result, error in
+                guard let self else { return }
+                if let result {
+                    let transcript = result.bestTranscription.formattedString
+                    DispatchQueue.main.async {
+                        self.handleRecognizedTranscript(transcript)
+                    }
+                }
+                if error != nil || (result?.isFinal == true) {
+                    DispatchQueue.main.async {
+                        self.restartRecognitionTaskIfNeeded()
+                    }
+                }
+            }
+        }
+
+        private func restartRecognitionTaskIfNeeded() {
+            guard isVoiceFollowActive, !isRestartingSession, audioEngine.isRunning else { return }
+            isRestartingSession = true
+            recognitionRequest?.endAudio()
+            recognitionTask?.cancel()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                guard let self else { return }
+                self.isRestartingSession = false
+                if self.isVoiceFollowActive && self.audioEngine.isRunning {
+                    self.startRecognitionTask()
+                }
+            }
+        }
+
+        func stopVoiceFollow() {
+            isVoiceFollowActive = false
+            voiceAudioLevel = 0
+            voiceStatusText = "Голос: Выкл"
+            stopVoiceDisplayLink()
+            stopAudioPipelinesOnly()
+            refreshPillUI()
+        }
+
+        private func stopAudioPipelinesOnly() {
+            if audioEngine.isRunning {
+                audioEngine.stop()
+            }
+            audioEngine.inputNode.removeTap(onBus: 0)
+            recognitionRequest?.endAudio()
+            recognitionRequest = nil
+            recognitionTask?.cancel()
+            recognitionTask = nil
+        }
+
+        private func startVoiceDisplayLink() {
+            guard voiceDisplayLink == nil else { return }
+            lastFrameTimestamp = nil
+            let link = CADisplayLink(target: self, selector: #selector(handleVoiceFrame(_:)))
+            if #available(iOS 15.0, *) {
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            }
+            link.add(to: .main, forMode: .common)
+            voiceDisplayLink = link
+        }
+
+        private func stopVoiceDisplayLink() {
+            voiceDisplayLink?.invalidate()
+            voiceDisplayLink = nil
+            lastFrameTimestamp = nil
+        }
+
+        @objc private func handleVoiceFrame(_ link: CADisplayLink) {
+            guard isVoiceFollowActive else { return }
+            if engine.isPlaying {
+                engine.pause()
+            }
+
+            let now = link.timestamp
+            let dt: CGFloat
+            if let last = lastFrameTimestamp {
+                dt = CGFloat(min(max(now - last, 1.0 / 240.0), 0.1))
+            } else {
+                dt = 1.0 / 60.0
+            }
+            lastFrameTimestamp = now
+
+            let mediaNow = CACurrentMediaTime()
+            let isSpeakingRecently = (mediaNow - lastVoiceActivityTime) < 0.38
+            let matchedRecently = (mediaNow - lastWordMatchTime) < 0.90
+            let diff = voiceTargetY - currentScrollY
+
+            var nextY = currentScrollY
+            var moved = false
+
+            if abs(diff) > 0.6 && (isSpeakingRecently || matchedRecently) {
+                let basePace = max(30.0, CGFloat(engine.speed))
+                let velocity = min(max(diff * 3.6, -basePace * 1.8), basePace * 2.8)
+                nextY += velocity * dt
+                moved = true
+            } else if isSpeakingRecently && diff >= -6 {
+                let maxLead = min(maxScrollY, voiceTargetY + 62)
+                if currentScrollY < maxLead {
+                    nextY += CGFloat(engine.speed) * 0.44 * dt
+                    moved = true
+                }
+            }
+
+            if moved {
+                let clamped = min(max(0, nextY), maxScrollY)
+                if abs(clamped - currentScrollY) > 0.04 {
+                    currentScrollY = clamped
+                    isInternalVoiceSeek = true
+                    engine.seek(to: clamped)
+                    isInternalVoiceSeek = false
+                }
+            }
+        }
+
+        private func analyzeMicrophoneBuffer(_ buffer: AVAudioPCMBuffer) {
+            guard let channelData = buffer.floatChannelData?[0] else { return }
+            let frameLength = Int(buffer.frameLength)
+            guard frameLength > 0 else { return }
+
+            var sum: Float = 0
+            let step = max(1, frameLength / 128)
+            var count = 0
+            var idx = 0
+            while idx < frameLength {
+                let sample = channelData[idx]
+                sum += sample * sample
+                count += 1
+                idx += step
+            }
+            let rms = sqrt(sum / Float(max(1, count)))
+            let normalizedLevel = min(max((rms - 0.008) * 18.0, 0), 1)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isVoiceFollowActive else { return }
+                self.voiceAudioLevel = self.voiceAudioLevel * 0.65 + normalizedLevel * 0.35
+                if normalizedLevel > 0.08 {
+                    self.lastVoiceActivityTime = CACurrentMediaTime()
+                }
+                self.refreshPillUI()
+
+                let now = CACurrentMediaTime()
+                if now - self.sessionStartTime > 52.0 && (now - self.lastVoiceActivityTime > 0.4) {
+                    self.restartRecognitionTaskIfNeeded()
+                }
+            }
+        }
+
+        // MARK: - Сопоставление русской речи со словами сценария
+
+        private func handleRecognizedTranscript(_ transcript: String) {
+            guard isVoiceFollowActive, !voiceAnchors.isEmpty else { return }
+
+            let spokenTokens = Self.tokenizeRussian(transcript, maxTailWords: 6)
+            guard let lastSpoken = spokenTokens.last else { return }
+
+            let now = CACurrentMediaTime()
+            lastVoiceActivityTime = now
+
+            let prevSpoken1 = spokenTokens.count >= 2 ? spokenTokens[spokenTokens.count - 2] : nil
+            let prevSpoken2 = spokenTokens.count >= 3 ? spokenTokens[spokenTokens.count - 3] : nil
+
+            let minIdx = max(0, currentAnchorIndex - 2)
+            let maxIdx = min(voiceAnchors.count - 1, currentAnchorIndex + 26)
+            guard minIdx <= maxIdx else { return }
+
+            var bestIndex: Int?
+            var bestScore: Double = 0
+
+            for idx in minIdx...maxIdx {
+                let anchor = voiceAnchors[idx]
+                let primarySim = Self.wordSimilarity(spoken: lastSpoken, anchor: anchor)
+                guard primarySim >= 0.72 else { continue }
+
+                let jump = idx - currentAnchorIndex
+
+                var prevMatchSim: Double = 0
+                if let prevSpoken1, idx >= 1 {
+                    prevMatchSim = max(
+                        Self.wordSimilarity(spoken: prevSpoken1, anchor: voiceAnchors[idx - 1]),
+                        idx >= 2 ? Self.wordSimilarity(spoken: prevSpoken1, anchor: voiceAnchors[idx - 2]) * 0.9 : 0
+                    )
+                }
+
+                if lastSpoken.norm.count <= 2 && jump > 2 && prevMatchSim < 0.75 {
+                    continue
+                }
+                if jump > 9 && prevMatchSim < 0.72 && lastSpoken.norm.count < 7 {
+                    continue
+                }
+
+                var prev2MatchSim: Double = 0
+                if let prevSpoken2, idx >= 2 {
+                    prev2MatchSim = Self.wordSimilarity(spoken: prevSpoken2, anchor: voiceAnchors[idx - 2])
+                }
+
+                let distancePenalty = abs(Double(jump - 1)) * 0.018
+                let score = primarySim
+                    + (prevMatchSim >= 0.72 ? prevMatchSim * 0.85 : 0)
+                    + (prev2MatchSim >= 0.72 ? prev2MatchSim * 0.45 : 0)
+                    - distancePenalty
+
+                if score > bestScore {
+                    bestScore = score
+                    bestIndex = idx
+                }
+            }
+
+            if let matchedIdx = bestIndex {
+                currentAnchorIndex = matchedIdx
+                lastWordMatchTime = now
+
+                let matchedAnchor = voiceAnchors[matchedIdx]
+                let leadOffset = min(max(18, viewportHeight * 0.04), 36)
+                voiceTargetY = min(max(0, matchedAnchor.targetScrollY + leadOffset), maxScrollY)
+
+                let previewWords = spokenTokens.suffix(2).map(\.norm).joined(separator: " ")
+                voiceStatusText = "«\(previewWords)»"
+                refreshPillUI()
+            }
+        }
+
+        private func syncAnchorIndex(toScrollY scrollY: CGFloat) {
+            guard !voiceAnchors.isEmpty else {
+                currentAnchorIndex = 0
+                return
+            }
+            var closestIdx = 0
+            var smallestDiff = CGFloat.greatestFiniteMagnitude
+            for anchor in voiceAnchors {
+                let diff = abs(anchor.targetScrollY - scrollY)
+                if diff < smallestDiff {
+                    smallestDiff = diff
+                    closestIdx = anchor.index
+                }
+            }
+            currentAnchorIndex = closestIdx
+        }
+
+        private static func normalizeRussianWord(_ raw: String) -> String {
+            let lowered = raw.lowercased().replacingOccurrences(of: "ё", with: "е")
+            let scalars = lowered.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+            return String(String.UnicodeScalarView(scalars))
+        }
+
+        private static func russianStem(for normalized: String) -> String {
+            let count = normalized.count
+            if count >= 7 {
+                return String(normalized.prefix(count - 2))
+            } else if count >= 5 {
+                return String(normalized.prefix(count - 1))
+            }
+            return normalized
+        }
+
+        private static func tokenizeRussian(_ text: String, maxTailWords: Int) -> [(norm: String, stem: String)] {
+            let parts = text.components(separatedBy: .whitespacesAndNewlines)
+            var result: [(norm: String, stem: String)] = []
+            for part in parts.suffix(maxTailWords * 2) {
+                let norm = normalizeRussianWord(part)
+                if !norm.isEmpty {
+                    result.append((norm: norm, stem: russianStem(for: norm)))
+                }
+            }
+            if result.count > maxTailWords {
+                return Array(result.suffix(maxTailWords))
+            }
+            return result
+        }
+
+        private static func wordSimilarity(spoken: (norm: String, stem: String), anchor: PrompterVoiceAnchor) -> Double {
+            if spoken.norm == anchor.normalizedWord {
+                return 1.0
+            }
+            if spoken.norm.count >= 4 && anchor.normalizedWord.count >= 4 {
+                if spoken.stem == anchor.stem {
+                    return 0.90
+                }
+                if anchor.normalizedWord.hasPrefix(spoken.stem) || spoken.norm.hasPrefix(anchor.stem) {
+                    return 0.84
+                }
+            }
+            if spoken.norm.count >= 5 && anchor.normalizedWord.count >= 5 {
+                let dist = levenshteinDistance(spoken.norm, anchor.normalizedWord)
+                if dist == 1 {
+                    return 0.82
+                } else if dist == 2 && spoken.norm.count >= 8 {
+                    return 0.75
+                }
+            }
+            return 0.0
+        }
+
+        private static func levenshteinDistance(_ a: String, _ b: String) -> Int {
+            let aChars = Array(a)
+            let bChars = Array(b)
+            let m = aChars.count
+            let n = bChars.count
+            if abs(m - n) > 2 { return 3 }
+            if m == 0 { return n }
+            if n == 0 { return m }
+
+            var prev = Array(0...n)
+            var curr = [Int](repeating: 0, count: n + 1)
+
+            for i in 1...m {
+                curr[0] = i
+                for j in 1...n {
+                    let cost = (aChars[i - 1] == bChars[j - 1]) ? 0 : 1
+                    curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+                }
+                prev = curr
+            }
+            return prev[n]
         }
     }
 }
