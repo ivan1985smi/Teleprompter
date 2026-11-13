@@ -3,45 +3,50 @@ import UIKit
 
 final class PrompterContainerView: UIView {
     let textView: UITextView
-        if #available(iOS 16.0, *) {
-            textView = UITextView(usingTextLayoutManager: false)
-        } else {
-            textView = UITextView()
-        }
-        textView.layoutManager.allowsNonContiguousLayout = false
     var onLayoutMetricsChanged: (() -> Void)?
 
     private var lastBoundsSize: CGSize = .zero
     private var lastSafeArea: UIEdgeInsets = .zero
 
     override init(frame: CGRect) {
+        if #available(iOS 16.0, *) {
+            // Классический движок TextKit 1 гарантирует, что текст не пропадёт через 10 секунд
+            self.textView = UITextView(usingTextLayoutManager: false)
+        } else {
+            self.textView = UITextView(frame: .zero)
+        }
         super.init(frame: frame)
-        backgroundColor = .clear
-        clipsToBounds = true
 
+        backgroundColor = .clear
+        isOpaque = false
+
+        textView.backgroundColor = .clear
+        textView.isOpaque = false
         textView.isEditable = false
         textView.isSelectable = false
         textView.isScrollEnabled = true
-        textView.backgroundColor = .clear
         textView.showsVerticalScrollIndicator = false
         textView.showsHorizontalScrollIndicator = false
-        textView.bounces = false
-        textView.alwaysBounceVertical = false
+        textView.alwaysBounceVertical = true
+        textView.alwaysBounceHorizontal = false
+        textView.clipsToBounds = true
         textView.contentInsetAdjustmentBehavior = .never
         textView.textContainer.lineFragmentPadding = 0
-        textView.clipsToBounds = true
+        textView.layoutManager.allowsNonContiguousLayout = false
 
         addSubview(textView)
     }
 
+    @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        textView.frame = bounds
-
+        if textView.frame != bounds {
+            textView.frame = bounds
+        }
         if bounds.size != lastBoundsSize || safeAreaInsets != lastSafeArea {
             lastBoundsSize = bounds.size
             lastSafeArea = safeAreaInsets
@@ -61,160 +66,177 @@ final class PrompterContainerView: UIView {
 struct PrompterScrollView: UIViewRepresentable {
     let text: String
     let settings: PrompterSettings
-    let engine: ScrollEngine
+    @ObservedObject var engine: ScrollEngine
+
+    init(text: String, settings: PrompterSettings, engine: ScrollEngine) {
+        self.text = text
+        self.settings = settings
+        self.engine = engine
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(engine: engine)
     }
 
     func makeUIView(context: Context) -> PrompterContainerView {
-        let container = PrompterContainerView()
-        container.textView.delegate = context.coordinator
+        let container = PrompterContainerView(frame: .zero)
+        let coordinator = context.coordinator
 
-        context.coordinator.container = container
-        container.onLayoutMetricsChanged = { [weak coordinator = context.coordinator] in
+        container.textView.delegate = coordinator
+        coordinator.containerView = container
+        coordinator.textView = container.textView
+
+        container.onLayoutMetricsChanged = { [weak coordinator] in
             coordinator?.recalculateLayoutMetrics()
         }
 
-        engine.attach(context.coordinator)
-        context.coordinator.apply(text: text, settings: settings, force: true)
+        coordinator.apply(text: text, settings: settings, force: true)
+        engine.attach(coordinator)
         return container
     }
 
     func updateUIView(_ container: PrompterContainerView, context: Context) {
         context.coordinator.engine = engine
-        context.coordinator.container = container
-        engine.attach(context.coordinator)
+        context.coordinator.containerView = container
+        context.coordinator.textView = container.textView
         context.coordinator.apply(text: text, settings: settings, force: false)
+        engine.attach(context.coordinator)
     }
 
     static func dismantleUIView(_ container: PrompterContainerView, coordinator: Coordinator) {
-        coordinator.engine.detach(coordinator)
         container.onLayoutMetricsChanged = nil
         container.textView.delegate = nil
+        coordinator.engine.detach(coordinator)
     }
 
-    @MainActor
-    final class Coordinator: NSObject, UIScrollViewDelegate, PrompterScrollSurface {
+    final class Coordinator: NSObject, UITextViewDelegate, PrompterScrollSurface {
         var engine: ScrollEngine
-        weak var container: PrompterContainerView?
+        weak var containerView: PrompterContainerView?
+        weak var textView: UITextView?
 
-        private var lastText: String?
-        private var lastFontSize: Double?
-        private var lastLineSpacing: Double?
-        private var lastAlignment: PrompterTextAlignment?
-        private var lastTextColor: RGBAColor?
-        private var lastReadingPosition: Double?
+        private var lastText: String = ""
+        private var lastSettings: PrompterSettings?
+        private var isProgrammaticScroll: Bool = false
 
         init(engine: ScrollEngine) {
             self.engine = engine
         }
 
         func apply(text: String, settings: PrompterSettings, force: Bool) {
-            guard let container else { return }
-            let textView = container.textView
+            guard let textView, let containerView else { return }
 
-            let typographyChanged = force
-                || text != lastText
-                || settings.fontSize != lastFontSize
-                || settings.lineSpacing != lastLineSpacing
-                || settings.textAlignment != lastAlignment
-                || settings.textColor != lastTextColor
+            let normalized = settings.normalized()
+            let textChanged = force || (text != lastText)
+            let settingsChanged = force || (normalized != lastSettings)
 
-            let guideChanged = force || settings.readingPosition != lastReadingPosition
+            if textChanged || settingsChanged {
+                let savedOffsetY = textView.contentOffset.y
 
-            if typographyChanged {
                 let paragraph = NSMutableParagraphStyle()
-                paragraph.lineSpacing = CGFloat(settings.lineSpacing)
-                paragraph.alignment = settings.textAlignment.nsTextAlignment
+                paragraph.lineSpacing = CGFloat(normalized.lineSpacing)
+                paragraph.alignment = normalized.textAlignment.nsTextAlignment
                 paragraph.lineBreakMode = .byWordWrapping
 
+                let font = UIFont.systemFont(ofSize: CGFloat(normalized.fontSize), weight: .semibold)
                 let attributes: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: CGFloat(settings.fontSize), weight: .semibold),
-                    .foregroundColor: settings.textColor.uiColor,
+                    .font: font,
+                    .foregroundColor: normalized.textColor.uiColor,
                     .paragraphStyle: paragraph
                 ]
-                textView.attributedText = NSAttributedString(string: text, attributes: attributes)
+
+                let displayString = text.isEmpty ? " " : text
+                isProgrammaticScroll = true
+                textView.attributedText = NSAttributedString(string: displayString, attributes: attributes)
+                textView.layoutManager.allowsNonContiguousLayout = false
+                textView.layoutManager.ensureLayout(for: textView.textContainer)
+                isProgrammaticScroll = false
 
                 lastText = text
-                lastFontSize = settings.fontSize
-                lastLineSpacing = settings.lineSpacing
-                lastAlignment = settings.textAlignment
-                lastTextColor = settings.textColor
-            }
+                lastSettings = normalized
 
-            if guideChanged {
-                lastReadingPosition = settings.readingPosition
-            }
+                let mirrorTransform = normalized.mirrored ? CGAffineTransform(scaleX: -1, y: 1) : .identity
+                if containerView.transform != mirrorTransform {
+                    containerView.transform = mirrorTransform
+                }
 
-            if typographyChanged || guideChanged {
                 recalculateLayoutMetrics()
+                displayScrollPosition(savedOffsetY)
+            } else {
+                let mirrorTransform = normalized.mirrored ? CGAffineTransform(scaleX: -1, y: 1) : .identity
+                if containerView.transform != mirrorTransform {
+                    containerView.transform = mirrorTransform
+                }
             }
-
-            let targetTransform = settings.mirrored
-                ? CGAffineTransform(scaleX: -1, y: 1)
-                : .identity
-            if container.transform.a != targetTransform.a || container.transform.d != targetTransform.d {
-                container.transform = targetTransform
-            }
-
-            textView.isScrollEnabled = !engine.isPlaying
         }
 
         func recalculateLayoutMetrics() {
-            guard let container else { return }
-            let textView = container.textView
-            let height = container.bounds.height
-            let width = container.bounds.width
-            guard height > 0, width > 0 else { return }
+            guard let textView, let containerView else { return }
+            let bounds = containerView.bounds
+            guard bounds.width > 10, bounds.height > 10 else { return }
 
-            let readingPos = lastReadingPosition ?? 0.38
-            let safeHorizontal = max(container.safeAreaInsets.left, container.safeAreaInsets.right)
-            let horizontalInset = safeHorizontal + 24
+            let settings = lastSettings ?? PrompterSettings()
+            let safeInsets = containerView.safeAreaInsets
+            let horizontalInset = max(20, safeInsets.left, safeInsets.right) + 16
 
-            textView.textContainerInset = UIEdgeInsets(
-                top: 0,
+            let readingRatio = CGFloat(min(max(settings.readingPosition, 0.15), 0.85))
+            let topAnchor = max(bounds.height * readingRatio, safeInsets.top + 72)
+            let bottomPadding = max(bounds.height * (1.0 - readingRatio) + 80, safeInsets.bottom + 140)
+
+            let targetContainerInset = UIEdgeInsets(
+                top: topAnchor,
                 left: horizontalInset,
-                bottom: 0,
+                bottom: bottomPadding,
                 right: horizontalInset
             )
 
-            let topInset = height * CGFloat(readingPos)
-            let bottomInset = height * (1 - CGFloat(readingPos))
-            textView.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: bottomInset, right: 0)
+            if textView.textContainerInset != targetContainerInset {
+                isProgrammaticScroll = true
+                textView.textContainerInset = targetContainerInset
+                isProgrammaticScroll = false
+            }
+
+            let targetWidth = max(10, bounds.width - targetContainerInset.left - targetContainerInset.right)
+            if abs(textView.textContainer.size.width - targetWidth) > 0.5 {
+                textView.textContainer.size = CGSize(width: targetWidth, height: .greatestFiniteMagnitude)
+            }
+
+            textView.layoutManager.ensureLayout(for: textView.textContainer)
             textView.layoutIfNeeded()
 
-            let maxPosition = max(
-                0,
-                textView.contentSize.height
-                    + textView.contentInset.top
-                    + textView.contentInset.bottom
-                    - height
-            )
-            engine.updateMetrics(maxPosition: maxPosition, viewportHeight: height)
+            let usedRect = textView.layoutManager.usedRect(for: textView.textContainer)
+            let totalContentHeight = ceil(usedRect.height + targetContainerInset.top + targetContainerInset.bottom)
+            let maxScroll = max(1, totalContentHeight - bounds.height)
+
+            engine.updateMetrics(maxPosition: maxScroll, viewportHeight: bounds.height)
         }
 
         func displayScrollPosition(_ position: CGFloat) {
-            guard let textView = container?.textView else { return }
-            let targetY = position - textView.contentInset.top
-            if abs(textView.contentOffset.y - targetY) > 0.01 {
-                textView.setContentOffset(CGPoint(x: 0, y: targetY), animated: false)
+            guard let textView else { return }
+            isProgrammaticScroll = true
+            let clampedY = max(0, position)
+            if abs(textView.contentOffset.y - clampedY) > 0.05 {
+                textView.contentOffset = CGPoint(x: 0, y: clampedY)
+                textView.setNeedsDisplay()
             }
+            isProgrammaticScroll = false
         }
 
         func setManualScrollingEnabled(_ enabled: Bool) {
+            // Держим isScrollEnabled = true всегда, чтобы iOS не гасила текст во время движения
             textView?.isScrollEnabled = true
             textView?.panGestureRecognizer.isEnabled = enabled
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-            engine.pause()
+            if engine.isPlaying {
+                engine.pause()
+            }
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
-            guard scrollView.isDragging || scrollView.isDecelerating else { return }
-            let position = scrollView.contentOffset.y + scrollView.contentInset.top
-            engine.updateFromManualScroll(position)
+            guard !isProgrammaticScroll,
+                  scrollView.isDragging || scrollView.isDecelerating else { return }
+            engine.updateFromManualScroll(scrollView.contentOffset.y)
         }
     }
 }
