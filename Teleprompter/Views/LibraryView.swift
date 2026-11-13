@@ -125,7 +125,7 @@ struct LibraryView: View {
                         Button {
                             showFileImporter = true
                         } label: {
-                            Label("Из файла TXT", systemImage: "doc.badge.plus")
+                            Label("Из файла (TXT, Word, PDF)", systemImage: "doc.badge.plus")
                         }
                     } label: {
                         Image(systemName: "plus.circle.fill")
@@ -142,7 +142,7 @@ struct LibraryView: View {
             }
             .fileImporter(
                 isPresented: $showFileImporter,
-                allowedContentTypes: [.plainText],
+                allowedContentTypes: [.plainText, .text, .pdf, .rtf, .rtfd, UTType(filenameExtension: "docx") ?? .data, UTType(filenameExtension: "doc") ?? .data, .data],
                 allowsMultipleSelection: false
             ) { result in
                 handleImport(result)

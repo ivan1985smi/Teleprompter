@@ -2,7 +2,13 @@ import SwiftUI
 import UIKit
 
 final class PrompterContainerView: UIView {
-    let textView = UITextView()
+    let textView: UITextView
+        if #available(iOS 16.0, *) {
+            textView = UITextView(usingTextLayoutManager: false)
+        } else {
+            textView = UITextView()
+        }
+        textView.layoutManager.allowsNonContiguousLayout = false
     var onLayoutMetricsChanged: (() -> Void)?
 
     private var lastBoundsSize: CGSize = .zero
@@ -197,7 +203,8 @@ struct PrompterScrollView: UIViewRepresentable {
         }
 
         func setManualScrollingEnabled(_ enabled: Bool) {
-            container?.textView.isScrollEnabled = enabled
+            textView?.isScrollEnabled = true
+            textView?.panGestureRecognizer.isEnabled = enabled
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
