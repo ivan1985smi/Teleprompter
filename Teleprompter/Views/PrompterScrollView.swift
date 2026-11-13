@@ -10,6 +10,7 @@ private struct PrompterVoiceAnchor {
     let stem: String
     let charRange: NSRange
     let targetScrollY: CGFloat
+    let lineHeight: CGFloat
 }
 
 final class PrompterContainerView: UIView {
@@ -181,7 +182,12 @@ struct PrompterScrollView: UIViewRepresentable {
         private var isProgrammaticScroll: Bool = false
         private var isInternalVoiceSeek: Bool = false
 
-        // MARK: - Голосовой автоскролл (Voice-Follow)
+        // Защита от прыжка позиции и соседнего ползунка при смене шрифта с пульта
+        private var progressHistory: [(time: CFTimeInterval, progress: Double)] = []
+        private var fontLockProgress: Double?
+        private var fontLockUntilTime: CFTimeInterval = 0
+
+        // MARK: - Голосовой автоскролл (Voice-Follow v2)
         private var isVoiceFollowActive: Bool = false
         private var voiceStatusText: String = "Голос: Выкл"
         private var voiceAudioLevel: Float = 0
@@ -190,6 +196,7 @@ struct PrompterScrollView: UIViewRepresentable {
         private var currentAnchorIndex: Int = 0
         private var currentScrollY: CGFloat = 0
         private var voiceTargetY: CGFloat = 0
+        private var voiceScrollVelocity: CGFloat = 0
         private var maxScrollY: CGFloat = 1
         private var viewportHeight: CGFloat = 600
 
@@ -202,6 +209,7 @@ struct PrompterScrollView: UIViewRepresentable {
 
         private var lastVoiceActivityTime: CFTimeInterval = 0
         private var lastWordMatchTime: CFTimeInterval = 0
+        private var lastSpokenWordCount: Int = 0
         private var sessionStartTime: CFTimeInterval = 0
         private var isRestartingSession: Bool = false
 
@@ -214,6 +222,29 @@ struct PrompterScrollView: UIViewRepresentable {
             stopVoiceFollow()
         }
 
+        private func recordProgressSnapshot(_ progress: Double) {
+            let now = CACurrentMediaTime()
+            progressHistory.append((time: now, progress: min(max(progress, 0), 1)))
+            if progressHistory.count > 40 {
+                progressHistory.removeFirst(progressHistory.count - 40)
+            }
+        }
+
+        private func stableProgressBeforeFontChange(now: CFTimeInterval) -> Double {
+            if let locked = fontLockProgress, now < fontLockUntilTime {
+                return locked
+            }
+            // Берём позицию за 0.25 сек до нажатия кнопки шрифта, чтобы отсечь случайный двойной сигнал пульта
+            let cutoff = now - 0.25
+            if let snapshot = progressHistory.last(where: { $0.time <= cutoff }) {
+                return snapshot.progress
+            }
+            if let first = progressHistory.first {
+                return first.progress
+            }
+            return maxScrollY > 0 ? min(max(Double(currentScrollY / maxScrollY), 0), 1) : engine.progress
+        }
+
         func apply(text: String, settings: PrompterSettings, force: Bool) {
             guard let textView, let containerView else { return }
 
@@ -222,9 +253,18 @@ struct PrompterScrollView: UIViewRepresentable {
 
             let textChanged = force || (text != lastText)
             let settingsChanged = force || (normalized != lastSettings)
+            let fontOrSpacingChanged = !force && !textChanged && lastSettings != nil && (
+                abs(normalized.fontSize - (lastSettings?.fontSize ?? normalized.fontSize)) > 0.01 ||
+                abs(normalized.lineSpacing - (lastSettings?.lineSpacing ?? normalized.lineSpacing)) > 0.01
+            )
 
             if textChanged || settingsChanged {
-                let savedOffsetY = textView.contentOffset.y
+                let now = CACurrentMediaTime()
+                let preservedProgress: Double? = fontOrSpacingChanged ? stableProgressBeforeFontChange(now: now) : nil
+                if let preservedProgress {
+                    fontLockProgress = preservedProgress
+                    fontLockUntilTime = now + 0.42
+                }
 
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.lineSpacing = CGFloat(normalized.lineSpacing)
@@ -249,8 +289,7 @@ struct PrompterScrollView: UIViewRepresentable {
                 lastSettings = normalized
 
                 applyMirrorTransform(mirrored: normalized.mirrored, to: containerView)
-                recalculateLayoutMetrics()
-                displayScrollPosition(savedOffsetY)
+                recalculateLayoutMetrics(preservingProgress: preservedProgress)
             } else {
                 applyMirrorTransform(mirrored: normalized.mirrored, to: containerView)
             }
@@ -265,7 +304,7 @@ struct PrompterScrollView: UIViewRepresentable {
             }
         }
 
-        func recalculateLayoutMetrics() {
+        func recalculateLayoutMetrics(preservingProgress: Double? = nil) {
             guard let textView, let containerView else { return }
             let bounds = containerView.bounds
             guard bounds.width > 10, bounds.height > 10 else { return }
@@ -308,6 +347,21 @@ struct PrompterScrollView: UIViewRepresentable {
 
             engine.updateMetrics(maxPosition: maxScroll, viewportHeight: bounds.height)
             rebuildVoiceWordAnchors(in: textView, maxScroll: maxScroll)
+
+            if let targetProgress = preservingProgress {
+                let lockedY = min(max(0, CGFloat(targetProgress) * maxScroll), maxScroll)
+                currentScrollY = lockedY
+                voiceTargetY = lockedY
+                voiceScrollVelocity = 0
+                syncAnchorIndex(toScrollY: lockedY)
+                isProgrammaticScroll = true
+                textView.contentOffset = CGPoint(x: 0, y: lockedY)
+                textView.setNeedsDisplay()
+                isProgrammaticScroll = false
+                isInternalVoiceSeek = true
+                engine.seek(to: lockedY)
+                isInternalVoiceSeek = false
+            }
         }
 
         private func rebuildVoiceWordAnchors(in textView: UITextView, maxScroll: CGFloat) {
@@ -333,13 +387,15 @@ struct PrompterScrollView: UIViewRepresentable {
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: wordRange, actualCharacterRange: nil)
                 let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
                 let targetY = min(max(0, rect.minY), maxScroll)
+                let height = max(24, rect.height)
 
                 let anchor = PrompterVoiceAnchor(
                     index: anchors.count,
                     normalizedWord: norm,
                     stem: Self.russianStem(for: norm),
                     charRange: wordRange,
-                    targetScrollY: targetY
+                    targetScrollY: targetY,
+                    lineHeight: height
                 )
                 anchors.append(anchor)
             }
@@ -350,8 +406,28 @@ struct PrompterScrollView: UIViewRepresentable {
 
         func displayScrollPosition(_ position: CGFloat) {
             guard let textView else { return }
+            let now = CACurrentMediaTime()
+
+            // Если только что изменился размер шрифта с пульта — гасим любые паразитные скачки соседнего ползунка
+            if let lockedProgress = fontLockProgress, now < fontLockUntilTime {
+                let lockedY = min(max(0, CGFloat(lockedProgress) * maxScrollY), maxScrollY)
+                if abs(position - lockedY) > 1.5 && !isInternalVoiceSeek {
+                    isProgrammaticScroll = true
+                    textView.contentOffset = CGPoint(x: 0, y: lockedY)
+                    isProgrammaticScroll = false
+                    isInternalVoiceSeek = true
+                    engine.seek(to: lockedY)
+                    isInternalVoiceSeek = false
+                    return
+                }
+            } else {
+                fontLockProgress = nil
+            }
+
+            let clampedY = min(max(0, position), maxScrollY)
+            let externalJump = !isInternalVoiceSeek && abs(clampedY - currentScrollY) > 35
+
             isProgrammaticScroll = true
-            let clampedY = max(0, position)
             currentScrollY = clampedY
             if abs(textView.contentOffset.y - clampedY) > 0.05 {
                 textView.contentOffset = CGPoint(x: 0, y: clampedY)
@@ -359,9 +435,14 @@ struct PrompterScrollView: UIViewRepresentable {
             }
             isProgrammaticScroll = false
 
-            // Если позицию сместили пультом или ползунком — синхронизируем голосовой прицел
-            if isVoiceFollowActive && !isInternalVoiceSeek {
+            if maxScrollY > 0 && !isInternalVoiceSeek {
+                recordProgressSnapshot(Double(clampedY / maxScrollY))
+            }
+
+            // Синхронизируем голосовой прицел ТОЛЬКО если пользователь сам перемотал текст пультом или ползунком
+            if isVoiceFollowActive && externalJump {
                 voiceTargetY = clampedY
+                voiceScrollVelocity = 0
                 syncAnchorIndex(toScrollY: clampedY)
             }
         }
@@ -380,10 +461,14 @@ struct PrompterScrollView: UIViewRepresentable {
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
             guard !isProgrammaticScroll,
                   scrollView.isDragging || scrollView.isDecelerating else { return }
-            let offsetY = max(0, scrollView.contentOffset.y)
+            let offsetY = min(max(0, scrollView.contentOffset.y), maxScrollY)
             currentScrollY = offsetY
+            if maxScrollY > 0 {
+                recordProgressSnapshot(Double(offsetY / maxScrollY))
+            }
             if isVoiceFollowActive {
                 voiceTargetY = offsetY
+                voiceScrollVelocity = 0
                 syncAnchorIndex(toScrollY: offsetY)
             }
             engine.updateFromManualScroll(offsetY)
@@ -459,9 +544,11 @@ struct PrompterScrollView: UIViewRepresentable {
                 isInternalVoiceSeek = false
                 currentScrollY = 0
                 voiceTargetY = 0
+                voiceScrollVelocity = 0
                 currentAnchorIndex = 0
             } else {
                 voiceTargetY = currentScrollY
+                voiceScrollVelocity = 0
                 syncAnchorIndex(toScrollY: currentScrollY)
             }
 
@@ -481,7 +568,7 @@ struct PrompterScrollView: UIViewRepresentable {
                 let inputNode = audioEngine.inputNode
                 let format = inputNode.outputFormat(forBus: 0)
                 inputNode.removeTap(onBus: 0)
-                inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                inputNode.installTap(onBus: 0, bufferSize: 512, format: format) { [weak self] buffer, _ in
                     guard let self else { return }
                     self.recognitionRequest?.append(buffer)
                     self.analyzeMicrophoneBuffer(buffer)
@@ -495,7 +582,7 @@ struct PrompterScrollView: UIViewRepresentable {
 
                 isVoiceFollowActive = true
                 textView?.panGestureRecognizer.isEnabled = true
-                voiceStatusText = "Слушаю речь..."
+                voiceStatusText = "Слушаю сценарий..."
                 refreshPillUI()
             } catch {
                 voiceStatusText = "Ошибка микрофона"
@@ -513,6 +600,7 @@ struct PrompterScrollView: UIViewRepresentable {
             request.taskHint = .dictation
             self.recognitionRequest = request
             self.sessionStartTime = CACurrentMediaTime()
+            self.lastSpokenWordCount = 0
 
             recognitionTask = speechRecognizer?.recognitionTask(with: request) { [weak self] result, error in
                 guard let self else { return }
@@ -535,7 +623,7 @@ struct PrompterScrollView: UIViewRepresentable {
             isRestartingSession = true
             recognitionRequest?.endAudio()
             recognitionTask?.cancel()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
                 guard let self else { return }
                 self.isRestartingSession = false
                 if self.isVoiceFollowActive && self.audioEngine.isRunning {
@@ -547,6 +635,7 @@ struct PrompterScrollView: UIViewRepresentable {
         func stopVoiceFollow() {
             isVoiceFollowActive = false
             voiceAudioLevel = 0
+            voiceScrollVelocity = 0
             voiceStatusText = "Голос: Выкл"
             stopVoiceDisplayLink()
             stopAudioPipelinesOnly()
@@ -590,41 +679,47 @@ struct PrompterScrollView: UIViewRepresentable {
             let now = link.timestamp
             let dt: CGFloat
             if let last = lastFrameTimestamp {
-                dt = CGFloat(min(max(now - last, 1.0 / 240.0), 0.1))
+                dt = CGFloat(min(max(now - last, 1.0 / 240.0), 0.05))
             } else {
                 dt = 1.0 / 60.0
             }
             lastFrameTimestamp = now
 
-            let mediaNow = CACurrentMediaTime()
-            let isSpeakingRecently = (mediaNow - lastVoiceActivityTime) < 0.38
-            let matchedRecently = (mediaNow - lastWordMatchTime) < 0.90
-            let diff = voiceTargetY - currentScrollY
-
-            var nextY = currentScrollY
-            var moved = false
-
-            if abs(diff) > 0.6 && (isSpeakingRecently || matchedRecently) {
-                let basePace = max(30.0, CGFloat(engine.speed))
-                let velocity = min(max(diff * 3.6, -basePace * 1.8), basePace * 2.8)
-                nextY += velocity * dt
-                moved = true
-            } else if isSpeakingRecently && diff >= -6 {
-                let maxLead = min(maxScrollY, voiceTargetY + 62)
-                if currentScrollY < maxLead {
-                    nextY += CGFloat(engine.speed) * 0.44 * dt
-                    moved = true
-                }
+            // Двигаем текст ТОЛЬКО к распознанным словам сценария (никакого движения от "бла-бла-бла"!)
+            let distance = voiceTargetY - currentScrollY
+            guard abs(distance) > 0.35 else {
+                voiceScrollVelocity = 0
+                return
             }
 
-            if moved {
-                let clamped = min(max(0, nextY), maxScrollY)
-                if abs(clamped - currentScrollY) > 0.04 {
-                    currentScrollY = clamped
-                    isInternalVoiceSeek = true
-                    engine.seek(to: clamped)
-                    isInternalVoiceSeek = false
-                }
+            // Критически демпфированная пружина (SmoothDamp):
+            // плавный разгон, быстрая реакция на скороговорку (до 1400 pt/s) и мягкая остановка без рывков
+            let smoothTime: CGFloat = distance > 90 ? 0.16 : 0.22
+            let omega: CGFloat = 2.0 / smoothTime
+            let x = omega * dt
+            let exp = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
+
+            var change = currentScrollY - voiceTargetY
+            let maxSpeed: CGFloat = 1400.0
+            let maxChange = maxSpeed * smoothTime
+            change = min(max(change, -maxChange), maxChange)
+
+            let target = currentScrollY - change
+            let temp = (voiceScrollVelocity + omega * change) * dt
+            voiceScrollVelocity = (voiceScrollVelocity - omega * temp) * exp
+            var nextY = target + (change + temp) * exp
+
+            if (voiceTargetY - currentScrollY > 0) == (nextY > voiceTargetY) {
+                nextY = voiceTargetY
+                voiceScrollVelocity = 0
+            }
+
+            let clamped = min(max(0, nextY), maxScrollY)
+            if abs(clamped - currentScrollY) > 0.04 {
+                currentScrollY = clamped
+                isInternalVoiceSeek = true
+                engine.seek(to: clamped)
+                isInternalVoiceSeek = false
             }
         }
 
@@ -655,84 +750,113 @@ struct PrompterScrollView: UIViewRepresentable {
                 self.refreshPillUI()
 
                 let now = CACurrentMediaTime()
-                if now - self.sessionStartTime > 52.0 && (now - self.lastVoiceActivityTime > 0.4) {
+                if now - self.sessionStartTime > 52.0 && (now - self.lastVoiceActivityTime > 0.45) {
                     self.restartRecognitionTaskIfNeeded()
                 }
             }
         }
 
-        // MARK: - Сопоставление русской речи со словами сценария
+        // MARK: - Сопоставление русской речи со словами сценария (с поддержкой быстрой читки)
 
         private func handleRecognizedTranscript(_ transcript: String) {
             guard isVoiceFollowActive, !voiceAnchors.isEmpty else { return }
 
-            let spokenTokens = Self.tokenizeRussian(transcript, maxTailWords: 6)
-            guard let lastSpoken = spokenTokens.last else { return }
+            let spokenTokens = Self.tokenizeRussian(transcript, maxTailWords: 8)
+            guard !spokenTokens.isEmpty else { return }
 
             let now = CACurrentMediaTime()
-            lastVoiceActivityTime = now
 
-            let prevSpoken1 = spokenTokens.count >= 2 ? spokenTokens[spokenTokens.count - 2] : nil
-            let prevSpoken2 = spokenTokens.count >= 3 ? spokenTokens[spokenTokens.count - 3] : nil
-
-            let minIdx = max(0, currentAnchorIndex - 2)
-            let maxIdx = min(voiceAnchors.count - 1, currentAnchorIndex + 26)
+            // Окно поиска от текущей позиции: от -1 слова назад до +38 слов вперёд (чтобы успевать за скороговоркой)
+            let minIdx = max(0, currentAnchorIndex - 1)
+            let maxIdx = min(voiceAnchors.count - 1, currentAnchorIndex + 38)
             guard minIdx <= maxIdx else { return }
 
-            var bestIndex: Int?
+            var bestEffectiveAnchorIdx: Int?
             var bestScore: Double = 0
+            var matchedDisplayWord: String = ""
 
-            for idx in minIdx...maxIdx {
-                let anchor = voiceAnchors[idx]
-                let primarySim = Self.wordSimilarity(spoken: lastSpoken, anchor: anchor)
-                guard primarySim >= 0.72 else { continue }
+            // Проверяем последние 4 произнесённых слова (от самого свежего к предыдущим),
+            // чтобы даже если последнее слово ещё договаривается по слогам, суфлёр мгновенно двигался по предыдущему слову
+            let maxOffsetFromEnd = min(3, spokenTokens.count - 1)
 
-                let jump = idx - currentAnchorIndex
+            for offsetFromEnd in 0...maxOffsetFromEnd {
+                let tokenPos = spokenTokens.count - 1 - offsetFromEnd
+                let token = spokenTokens[tokenPos]
+                let prevToken1 = tokenPos >= 1 ? spokenTokens[tokenPos - 1] : nil
+                let prevToken2 = tokenPos >= 2 ? spokenTokens[tokenPos - 2] : nil
 
-                var prevMatchSim: Double = 0
-                if let prevSpoken1, idx >= 1 {
-                    prevMatchSim = max(
-                        Self.wordSimilarity(spoken: prevSpoken1, anchor: voiceAnchors[idx - 1]),
-                        idx >= 2 ? Self.wordSimilarity(spoken: prevSpoken1, anchor: voiceAnchors[idx - 2]) * 0.9 : 0
-                    )
-                }
+                for idx in minIdx...maxIdx {
+                    let anchor = voiceAnchors[idx]
+                    let primarySim = Self.wordSimilarity(spoken: token, anchor: anchor)
+                    guard primarySim >= 0.78 else { continue }
 
-                if lastSpoken.norm.count <= 2 && jump > 2 && prevMatchSim < 0.75 {
-                    continue
-                }
-                if jump > 9 && prevMatchSim < 0.72 && lastSpoken.norm.count < 7 {
-                    continue
-                }
+                    var prevSim1: Double = 0
+                    if let prevToken1, idx >= 1 {
+                        prevSim1 = max(
+                            Self.wordSimilarity(spoken: prevToken1, anchor: voiceAnchors[idx - 1]),
+                            idx >= 2 ? Self.wordSimilarity(spoken: prevToken1, anchor: voiceAnchors[idx - 2]) * 0.92 : 0
+                        )
+                    }
 
-                var prev2MatchSim: Double = 0
-                if let prevSpoken2, idx >= 2 {
-                    prev2MatchSim = Self.wordSimilarity(spoken: prevSpoken2, anchor: voiceAnchors[idx - 2])
-                }
+                    var prevSim2: Double = 0
+                    if let prevToken2, idx >= 2 {
+                        prevSim2 = Self.wordSimilarity(spoken: prevToken2, anchor: voiceAnchors[idx - 2])
+                    }
 
-                let distancePenalty = abs(Double(jump - 1)) * 0.018
-                let score = primarySim
-                    + (prevMatchSim >= 0.72 ? prevMatchSim * 0.85 : 0)
-                    + (prev2MatchSim >= 0.72 ? prev2MatchSim * 0.45 : 0)
-                    - distancePenalty
+                    let jump = idx - currentAnchorIndex
 
-                if score > bestScore {
-                    bestScore = score
-                    bestIndex = idx
+                    // Жёсткий фильтр от "бла-бла-бла" и случайных коротких междометий:
+                    // слова из 1–3 букв срабатывают ТОЛЬКО если они стоят прямо на очереди ИЛИ совпало предыдущее слово
+                    if token.norm.count <= 2 {
+                        guard jump >= 0 && jump <= 1 && prevSim1 >= 0.82 else { continue }
+                    } else if token.norm.count == 3 {
+                        guard (jump >= 0 && jump <= 2 && primarySim >= 0.95) || prevSim1 >= 0.80 else { continue }
+                    }
+
+                    // Для скачка дальше чем на 6 слов вперёд требуем либо совпадение связки из 2 слов, либо длинное уникальное слово (>= 6 букв)
+                    if jump > 6 && prevSim1 < 0.78 && (token.norm.count < 6 || primarySim < 0.90) {
+                        continue
+                    }
+                    if jump > 16 && prevSim1 < 0.82 {
+                        continue
+                    }
+
+                    let distancePenalty = max(0, Double(jump - 1)) * 0.012 + (jump < 0 ? 0.15 : 0)
+                    let recencyBonus = Double(maxOffsetFromEnd - offsetFromEnd) * 0.08
+                    let score = primarySim
+                        + (prevSim1 >= 0.78 ? prevSim1 * 0.95 : 0)
+                        + (prevSim2 >= 0.78 ? prevSim2 * 0.45 : 0)
+                        + recencyBonus
+                        - distancePenalty
+
+                    if score > bestScore {
+                        bestScore = score
+                        // Если совпало предпоследнее слово, а после него уже звучит ещё 1–2 слова — прибавляем их индекс!
+                        let effectiveIdx = min(voiceAnchors.count - 1, idx + offsetFromEnd)
+                        bestEffectiveAnchorIdx = effectiveIdx
+                        matchedDisplayWord = spokenTokens.suffix(2).map(\.norm).joined(separator: " ")
+                    }
                 }
             }
 
-            if let matchedIdx = bestIndex {
-                currentAnchorIndex = matchedIdx
-                lastWordMatchTime = now
-
-                let matchedAnchor = voiceAnchors[matchedIdx]
-                let leadOffset = min(max(18, viewportHeight * 0.04), 36)
-                voiceTargetY = min(max(0, matchedAnchor.targetScrollY + leadOffset), maxScrollY)
-
-                let previewWords = spokenTokens.suffix(2).map(\.norm).joined(separator: " ")
-                voiceStatusText = "«\(previewWords)»"
-                refreshPillUI()
+            guard let matchedIdx = bestEffectiveAnchorIdx, matchedIdx >= currentAnchorIndex else {
+                return
             }
+
+            currentAnchorIndex = matchedIdx
+            lastWordMatchTime = now
+
+            let matchedAnchor = voiceAnchors[matchedIdx]
+            // Выводим читаемую строку чуть выше центра меток (+75% высоты строки), чтобы взгляд всегда видел следующие слова
+            let leadOffset = max(matchedAnchor.lineHeight * 0.75, viewportHeight * 0.045)
+            let newTargetY = min(max(0, matchedAnchor.targetScrollY + leadOffset), maxScrollY)
+
+            if newTargetY > voiceTargetY || abs(newTargetY - voiceTargetY) > matchedAnchor.lineHeight * 1.5 {
+                voiceTargetY = newTargetY
+            }
+
+            voiceStatusText = "«\(matchedDisplayWord)»"
+            refreshPillUI()
         }
 
         private func syncAnchorIndex(toScrollY scrollY: CGFloat) {
@@ -789,18 +913,18 @@ struct PrompterScrollView: UIViewRepresentable {
             }
             if spoken.norm.count >= 4 && anchor.normalizedWord.count >= 4 {
                 if spoken.stem == anchor.stem {
-                    return 0.90
+                    return 0.92
                 }
                 if anchor.normalizedWord.hasPrefix(spoken.stem) || spoken.norm.hasPrefix(anchor.stem) {
-                    return 0.84
+                    return 0.85
                 }
             }
             if spoken.norm.count >= 5 && anchor.normalizedWord.count >= 5 {
                 let dist = levenshteinDistance(spoken.norm, anchor.normalizedWord)
                 if dist == 1 {
-                    return 0.82
+                    return 0.84
                 } else if dist == 2 && spoken.norm.count >= 8 {
-                    return 0.75
+                    return 0.78
                 }
             }
             return 0.0
