@@ -1,143 +1,159 @@
 import Foundation
 import QuartzCore
-import UIKit
+import CoreGraphics
+import Combine
 
-@MainActor
 protocol PrompterScrollSurface: AnyObject {
     func displayScrollPosition(_ position: CGFloat)
     func setManualScrollingEnabled(_ enabled: Bool)
 }
 
-@MainActor
 final class ScrollEngine: ObservableObject {
-    @Published private(set) var isPlaying = false
+    @Published private(set) var isPlaying: Bool = false
     @Published private(set) var progress: Double = 0
-    @Published private(set) var reachedEnd = false
-    @Published private(set) var remainingSeconds: Int = 0
+    @Published private(set) var reachedEnd: Bool = false
 
-    var speed: Double = 70 {
-        didSet {
-            let clamped = speed.isFinite
-                ? min(max(speed, PrompterSettings.speedRange.lowerBound), PrompterSettings.speedRange.upperBound)
-                : 70
-            if speed != clamped {
-                speed = clamped
-            }
-            updateRemainingTime(force: true)
-        }
-    }
-
-    weak var surface: PrompterScrollSurface? {
-        didSet {
-            surface?.setManualScrollingEnabled(!isPlaying)
-            surface?.displayScrollPosition(CGFloat(position))
-        }
-    }
+    var speed: Double = 75
+    weak var surface: PrompterScrollSurface?
 
     private var displayLink: CADisplayLink?
     private var lastTimestamp: CFTimeInterval?
-    private var lastProgressPublish: CFTimeInterval = 0
 
-    private var position: Double = 0
-    private var maxPosition: Double = 0
-    private var viewportHeight: CGFloat = 0
+    private var position: CGFloat = 0
+    private var maxPosition: CGFloat = 1
+    private var viewportHeight: CGFloat = 600
+
+    private var pendingSeekOffset: CGFloat = 0
+    private var lastPublishedProgress: Double = -1
+
+    init() {}
+
+    deinit {
+        stopDisplayLink()
+    }
 
     func attach(_ surface: PrompterScrollSurface) {
         self.surface = surface
+        surface.setManualScrollingEnabled(!isPlaying)
+        surface.displayScrollPosition(position)
     }
 
     func detach(_ surface: PrompterScrollSurface) {
-        guard self.surface === surface else { return }
-        pause()
-        self.surface = nil
+        if self.surface === surface {
+            self.surface = nil
+        }
+        stopDisplayLink()
     }
 
     func play() {
-        guard !isPlaying, maxPosition > 0 else { return }
-        if position >= maxPosition - 0.5 {
+        guard !isPlaying else { return }
+        if reachedEnd || (maxPosition > 1 && position >= maxPosition - 1) {
             position = 0
+            pendingSeekOffset = 0
             reachedEnd = false
-            surface?.displayScrollPosition(0)
+            publishProgress(force: true)
+            surface?.displayScrollPosition(position)
         }
         isPlaying = true
         surface?.setManualScrollingEnabled(false)
-        lastTimestamp = nil
-        startDisplayLink()
-        publishProgress(force: true)
+        ensureDisplayLinkRunning()
     }
 
     func pause() {
         guard isPlaying else { return }
         isPlaying = false
-        stopDisplayLink()
         surface?.setManualScrollingEnabled(true)
         publishProgress(force: true)
+        if abs(pendingSeekOffset) < 0.5 {
+            stopDisplayLink()
+        }
     }
 
     func toggle() {
-        isPlaying ? pause() : play()
+        if isPlaying {
+            pause()
+        } else {
+            play()
+        }
     }
 
     func restart() {
         pause()
+        pendingSeekOffset = 0
+        position = 0
         reachedEnd = false
-        seek(to: 0)
+        surface?.displayScrollPosition(0)
+        publishProgress(force: true)
     }
 
     func seek(by delta: CGFloat) {
-        seek(to: position + Double(delta))
+        let adjustedDelta: CGFloat = abs(delta) > 100 ? (delta * 0.42) : delta
+        let target = clampPosition(position + pendingSeekOffset + adjustedDelta)
+        pendingSeekOffset = target - position
+        reachedEnd = (maxPosition > 0 && target >= maxPosition - 0.5)
+        ensureDisplayLinkRunning()
     }
 
     func seekPage(forward: Bool) {
-        let step = max(Double(viewportHeight) * 0.75, 120)
-        seek(by: forward ? step : -step)
+        let step = min(max(80, viewportHeight * 0.20), 145)
+        let signedStep = forward ? step : -step
+        let target = clampPosition(position + pendingSeekOffset + signedStep)
+        pendingSeekOffset = target - position
+        reachedEnd = (maxPosition > 0 && target >= maxPosition - 0.5)
+        ensureDisplayLinkRunning()
     }
 
     func seek(to newPosition: Double) {
-        guard newPosition.isFinite else { return }
-        position = min(max(newPosition, 0), maxPosition)
-        reachedEnd = position >= maxPosition && maxPosition > 0
-        if reachedEnd { pause() }
-        surface?.displayScrollPosition(CGFloat(position))
+        seek(to: CGFloat(newPosition))
+    }
+
+    func seek(to newPosition: CGFloat) {
+        pendingSeekOffset = 0
+        position = clampPosition(newPosition)
+        reachedEnd = (maxPosition > 0 && position >= maxPosition - 0.5)
+        surface?.displayScrollPosition(position)
         publishProgress(force: true)
     }
 
     func seek(toProgress newProgress: Double) {
-        guard newProgress.isFinite else { return }
-        seek(to: min(max(newProgress, 0), 1) * maxPosition)
+        let clamped = min(max(newProgress, 0), 1)
+        seek(to: CGFloat(clamped) * maxPosition)
     }
 
     func updateFromManualScroll(_ newPosition: CGFloat) {
-        guard !isPlaying, newPosition.isFinite else { return }
-        position = min(max(Double(newPosition), 0), maxPosition)
-        reachedEnd = position >= maxPosition && maxPosition > 0
+        guard !isPlaying else { return }
+        pendingSeekOffset = 0
+        position = clampPosition(newPosition)
+        reachedEnd = (maxPosition > 0 && position >= maxPosition - 0.5)
         publishProgress(force: false)
     }
 
     func updateMetrics(maxPosition: CGFloat, viewportHeight: CGFloat) {
-        let previousRatio = self.maxPosition > 0 ? min(max(position / self.maxPosition, 0), 1) : 0
-        let newMax = max(0, Double(maxPosition))
-
-        self.viewportHeight = viewportHeight
-        self.maxPosition = newMax
-
-        if previousRatio > 0 && newMax > 0 {
-            position = min(previousRatio * newMax, newMax)
-        } else {
-            position = min(position, newMax)
-        }
-
-        reachedEnd = newMax > 0 && position >= newMax - 0.5
-        surface?.displayScrollPosition(CGFloat(position))
+        self.maxPosition = max(1, maxPosition)
+        self.viewportHeight = max(100, viewportHeight)
+        self.position = clampPosition(self.position)
+        surface?.displayScrollPosition(self.position)
         publishProgress(force: true)
     }
 
-    private func startDisplayLink() {
-        stopDisplayLink()
-        let proxy = DisplayLinkProxy(engine: self)
-        let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.step(_:)))
+    private func clampPosition(_ value: CGFloat) -> CGFloat {
+        min(max(0, value), maxPosition)
+    }
+
+    private func publishProgress(force: Bool) {
+        let newProgress = maxPosition > 0 ? min(max(Double(position / maxPosition), 0), 1) : 0
+        if force || abs(newProgress - lastPublishedProgress) >= 0.002 {
+            lastPublishedProgress = newProgress
+            progress = newProgress
+        }
+    }
+
+    private func ensureDisplayLinkRunning() {
+        guard displayLink == nil else { return }
+        lastTimestamp = nil
+        let link = CADisplayLink(target: self, selector: #selector(handleFrame(_:)))
         if #available(iOS 15.0, *) {
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 120)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
         }
         link.add(to: .main, forMode: .common)
         displayLink = link
@@ -149,65 +165,56 @@ final class ScrollEngine: ObservableObject {
         lastTimestamp = nil
     }
 
-    fileprivate func handleFrame(_ link: CADisplayLink) {
-        guard isPlaying else { return }
-        guard let previous = lastTimestamp else {
-            lastTimestamp = link.timestamp
-            return
+    @objc private func handleFrame(_ link: CADisplayLink) {
+        let now = link.timestamp
+        let dt: CGFloat
+        if let last = lastTimestamp {
+            dt = CGFloat(min(max(now - last, 1.0 / 240.0), 0.1))
+        } else {
+            dt = 1.0 / 60.0
         }
-        let delta = min(max(link.timestamp - previous, 0), 0.1)
-        lastTimestamp = link.timestamp
-        position += speed * delta
+        lastTimestamp = now
 
-        if position >= maxPosition {
-            position = maxPosition
-            reachedEnd = true
-            surface?.displayScrollPosition(CGFloat(position))
-            pause()
-            return
+        var changed = false
+
+        if isPlaying {
+            position += CGFloat(speed) * dt
+            changed = true
         }
 
-        surface?.displayScrollPosition(CGFloat(position))
-        publishProgress(force: false)
-    }
-
-    private func publishProgress(force: Bool) {
-        let now = CACurrentMediaTime()
-        guard force || now - lastProgressPublish >= 0.1 else { return }
-        lastProgressPublish = now
-        let value = maxPosition > 0 ? position / maxPosition : 0
-        if abs(progress - value) > 0.0001 || force {
-            progress = min(max(value, 0), 1)
+        if abs(pendingSeekOffset) > 0.3 {
+            let smoothing = min(1.0, dt * 14.0)
+            let step = pendingSeekOffset * smoothing
+            position += step
+            pendingSeekOffset -= step
+            changed = true
+        } else if pendingSeekOffset != 0 {
+            position += pendingSeekOffset
+            pendingSeekOffset = 0
+            changed = true
         }
-        updateRemainingTime(force: force)
-    }
 
-    private func updateRemainingTime(force: Bool) {
-        guard speed > 0, maxPosition > position else {
-            if remainingSeconds != 0 { remainingSeconds = 0 }
-            return
+        if changed {
+            position = clampPosition(position)
+            surface?.displayScrollPosition(position)
+            publishProgress(force: false)
+
+            if isPlaying && maxPosition > 1 && position >= maxPosition - 0.5 {
+                position = maxPosition
+                pendingSeekOffset = 0
+                reachedEnd = true
+                isPlaying = false
+                surface?.setManualScrollingEnabled(true)
+                publishProgress(force: true)
+                stopDisplayLink()
+                return
+            }
         }
-        let seconds = Int(ceil((maxPosition - position) / speed))
-        if remainingSeconds != seconds || force {
-            remainingSeconds = max(0, seconds)
-        }
-    }
 
-    deinit {
-        displayLink?.invalidate()
-    }
-}
-
-private final class DisplayLinkProxy: NSObject {
-    weak var engine: ScrollEngine?
-
-    init(engine: ScrollEngine) {
-        self.engine = engine
-    }
-
-    @objc func step(_ link: CADisplayLink) {
-        Task { @MainActor [weak engine] in
-            engine?.handleFrame(link)
+        if !isPlaying && abs(pendingSeekOffset) <= 0.3 {
+            pendingSeekOffset = 0
+            publishProgress(force: true)
+            stopDisplayLink()
         }
     }
 }
