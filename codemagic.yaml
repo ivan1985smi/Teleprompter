@@ -3,12 +3,13 @@ workflows:
     name: Build Unsigned IPA
     max_build_duration: 20
     scripts:
-      - name: Prepare Assets and Fix Xcode Project Paths
+      - name: Prepare Assets and Fix Code
         script: |
           python3 - <<'PY'
           import json, struct, zlib
           from pathlib import Path
 
+          # 1. Создаём каталог иконок Assets.xcassets
           base = Path("Teleprompter/Resources/Assets.xcassets")
           appicon = base / "AppIcon.appiconset"
           accent = base / "AccentColor.colorset"
@@ -48,26 +49,29 @@ workflows:
               ihdr = struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)
               icon_file.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
 
+          # 2. Исправляем путь к Assets.xcassets в генераторе проекта
           gen = Path("Tools/generate_project.py")
-          text = gen.read_text(encoding="utf-8")
-          text = text.replace(
-              '"path": "Assets.xcassets",\n    "sourceTree": "<group>"',
-              '"path": "Teleprompter/Resources/Assets.xcassets",\n    "sourceTree": "SOURCE_ROOT"'
-          )
-          text = text.replace(
-              '"path": path.name,\n        "sourceTree": "<group>"',
-              '"path": f"Teleprompter/{rel.as_posix()}",\n        "sourceTree": "SOURCE_ROOT"'
-          )
-          text = text.replace(
-              '"path": group,\n        "sourceTree": "<group>"',
-              '"name": group,\n        "sourceTree": "<group>"'
-          )
-          text = text.replace(
-              'add("PBXGroup", "group-main", "", {',
-              'add("PBXGroup", "group-main", "Main", {'
-          )
-          gen.write_text(text, encoding="utf-8")
-          print("Project generator patched successfully")
+          if gen.exists():
+              text = gen.read_text(encoding="utf-8")
+              text = text.replace('"path": "Assets.xcassets",\n    "sourceTree": "<group>"', '"path": "Teleprompter/Resources/Assets.xcassets",\n    "sourceTree": "SOURCE_ROOT"')
+              gen.write_text(text, encoding="utf-8")
+
+          # 3. Заменяем несуществующие GCKeyCode.volumeUp/volumeDown на HID-коды
+          rm = Path("Teleprompter/Models/RemoteMapping.swift")
+          if rm.exists():
+              rm_text = rm.read_text(encoding="utf-8")
+              rm_text = rm_text.replace("Int(GCKeyCode.volumeUp.rawValue)", "0x80")
+              rm_text = rm_text.replace("Int(GCKeyCode.volumeDown.rawValue)", "0x81")
+              rm.write_text(rm_text, encoding="utf-8")
+
+          # 4. Исправляем протокол делегата на UITextViewDelegate
+          psv = Path("Teleprompter/Views/PrompterScrollView.swift")
+          if psv.exists():
+              psv_text = psv.read_text(encoding="utf-8")
+              psv_text = psv_text.replace("NSObject, UIScrollViewDelegate, PrompterScrollSurface", "NSObject, UITextViewDelegate, PrompterScrollSurface")
+              psv.write_text(psv_text, encoding="utf-8")
+
+          print("All fixes applied successfully!")
           PY
       - name: Regenerate Xcode project
         script: python3 Tools/generate_project.py
