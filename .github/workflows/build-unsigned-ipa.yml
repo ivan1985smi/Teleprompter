@@ -1,0 +1,30 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: macOS / Xcode build
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Regenerate Xcode project
+        run: python3 Tools/generate_project.py
+
+      - name: Build unsigned IPA
+        run: bash Tools/build_unsigned_ipa.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Teleprompter-iOS-IPA
+          path: Teleprompter-unsigned.ipa
+          if-no-files-found: error
