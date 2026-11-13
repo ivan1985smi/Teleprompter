@@ -1,9 +1,12 @@
 import SwiftUI
 import UIKit
+import Combine
 
 final class PrompterContainerView: UIView {
     let textView: UITextView
+    let voicePillButton: UIButton = UIButton(type: .system)
     var onLayoutMetricsChanged: (() -> Void)?
+    var onToggleVoiceFollow: (() -> Void)?
 
     private var lastBoundsSize: CGSize = .zero
     private var lastSafeArea: UIEdgeInsets = .zero
@@ -34,6 +37,41 @@ final class PrompterContainerView: UIView {
         textView.layoutManager.allowsNonContiguousLayout = false
 
         addSubview(textView)
+        setupVoicePillButton()
+    }
+
+    private func setupVoicePillButton() {
+        voicePillButton.backgroundColor = UIColor(white: 0.14, alpha: 0.86)
+        voicePillButton.layer.cornerRadius = 17
+        voicePillButton.layer.cornerCurve = .continuous
+        voicePillButton.layer.borderWidth = 1
+        voicePillButton.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+        voicePillButton.tintColor = .white
+        voicePillButton.setTitleColor(.white, for: .normal)
+        voicePillButton.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        voicePillButton.contentEdgeInsets = UIEdgeInsets(top: 7, left: 13, bottom: 7, right: 13)
+        voicePillButton.setTitle("🎙 Голос: Выкл", for: .normal)
+        voicePillButton.addTarget(self, action: #selector(handleVoiceButtonTap), for: .touchUpInside)
+        addSubview(voicePillButton)
+    }
+
+    @objc private func handleVoiceButtonTap() {
+        onToggleVoiceFollow?()
+    }
+
+    func updateVoicePillState(active: Bool, statusText: String, level: Float) {
+        let title = active ? "🟢 🎙 \(statusText)" : "🎙 \(statusText)"
+        voicePillButton.setTitle(title, for: .normal)
+
+        if active {
+            let pulseAlpha = CGFloat(0.28 + min(max(level, 0), 1) * 0.42)
+            voicePillButton.backgroundColor = UIColor.systemOrange.withAlphaComponent(pulseAlpha)
+            voicePillButton.layer.borderColor = UIColor.systemOrange.cgColor
+        } else {
+            voicePillButton.backgroundColor = UIColor(white: 0.14, alpha: 0.86)
+            voicePillButton.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+        }
+        setNeedsLayout()
     }
 
     @available(*, unavailable)
@@ -46,6 +84,17 @@ final class PrompterContainerView: UIView {
         if textView.frame != bounds {
             textView.frame = bounds
         }
+
+        voicePillButton.sizeToFit()
+        let pillWidth = min(max(voicePillButton.bounds.width, 136), bounds.width - 32)
+        let pillHeight: CGFloat = 34
+        let rightMargin = max(16, safeAreaInsets.right + 12)
+        let topY = safeAreaInsets.top + 64
+        // Если контейнер отзеркален, размещаем кнопку у противоположного края, чтобы на экране она всегда была справа
+        let isMirrored = transform.a < 0
+        let pillX = isMirrored ? rightMargin : (bounds.width - pillWidth - rightMargin)
+        voicePillButton.frame = CGRect(x: pillX, y: topY, width: pillWidth, height: pillHeight)
+
         if bounds.size != lastBoundsSize || safeAreaInsets != lastSafeArea {
             lastBoundsSize = bounds.size
             lastSafeArea = safeAreaInsets
@@ -88,7 +137,11 @@ struct PrompterScrollView: UIViewRepresentable {
         container.onLayoutMetricsChanged = { [weak coordinator] in
             coordinator?.recalculateLayoutMetrics()
         }
+        container.onToggleVoiceFollow = { [weak coordinator] in
+            coordinator?.engine.toggleVoiceFollow()
+        }
 
+        coordinator.bindVoiceUpdates()
         coordinator.apply(text: text, settings: settings, force: true)
         engine.attach(coordinator)
         return container
@@ -104,7 +157,9 @@ struct PrompterScrollView: UIViewRepresentable {
 
     static func dismantleUIView(_ container: PrompterContainerView, coordinator: Coordinator) {
         container.onLayoutMetricsChanged = nil
+        container.onToggleVoiceFollow = nil
         container.textView.delegate = nil
+        coordinator.cancellables.removeAll()
         coordinator.engine.detach(coordinator)
     }
 
@@ -116,9 +171,24 @@ struct PrompterScrollView: UIViewRepresentable {
         private var lastText: String = ""
         private var lastSettings: PrompterSettings?
         private var isProgrammaticScroll: Bool = false
+        var cancellables = Set<AnyCancellable>()
 
         init(engine: ScrollEngine) {
             self.engine = engine
+        }
+
+        func bindVoiceUpdates() {
+            cancellables.removeAll()
+            Publishers.CombineLatest3(
+                engine.$isVoiceFollowActive,
+                engine.$voiceStatusText,
+                engine.$voiceAudioLevel
+            )
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] active, status, level in
+                self?.containerView?.updateVoicePillState(active: active, statusText: status, level: level)
+            }
+            .store(in: &cancellables)
         }
 
         func apply(text: String, settings: PrompterSettings, force: Bool) {
@@ -155,18 +225,20 @@ struct PrompterScrollView: UIViewRepresentable {
                 lastText = text
                 lastSettings = normalized
 
-                let mirrorTransform = normalized.mirrored ? CGAffineTransform(scaleX: -1, y: 1) : .identity
-                if containerView.transform != mirrorTransform {
-                    containerView.transform = mirrorTransform
-                }
-
+                applyMirrorTransform(mirrored: normalized.mirrored, to: containerView)
                 recalculateLayoutMetrics()
                 displayScrollPosition(savedOffsetY)
             } else {
-                let mirrorTransform = normalized.mirrored ? CGAffineTransform(scaleX: -1, y: 1) : .identity
-                if containerView.transform != mirrorTransform {
-                    containerView.transform = mirrorTransform
-                }
+                applyMirrorTransform(mirrored: normalized.mirrored, to: containerView)
+            }
+        }
+
+        private func applyMirrorTransform(mirrored: Bool, to containerView: PrompterContainerView) {
+            let mirrorTransform = mirrored ? CGAffineTransform(scaleX: -1, y: 1) : .identity
+            if containerView.transform != mirrorTransform {
+                containerView.transform = mirrorTransform
+                containerView.voicePillButton.transform = mirrorTransform
+                containerView.setNeedsLayout()
             }
         }
 
@@ -209,6 +281,43 @@ struct PrompterScrollView: UIViewRepresentable {
             let maxScroll = max(1, totalContentHeight - bounds.height)
 
             engine.updateMetrics(maxPosition: maxScroll, viewportHeight: bounds.height)
+            rebuildVoiceWordAnchors(in: textView, maxScroll: maxScroll)
+        }
+
+        private func rebuildVoiceWordAnchors(in textView: UITextView, maxScroll: CGFloat) {
+            let nsString = (textView.text ?? "") as NSString
+            guard nsString.length > 0 else {
+                engine.updateVoiceAnchors([])
+                return
+            }
+
+            var anchors: [VoiceWordAnchor] = []
+            let layoutManager = textView.layoutManager
+            let textContainer = textView.textContainer
+
+            nsString.enumerateSubstrings(
+                in: NSRange(location: 0, length: nsString.length),
+                options: [.byWords]
+            ) { substring, wordRange, _, _ in
+                guard let substring else { return }
+                let norm = ScrollEngine.normalizeRussianWord(substring)
+                guard !norm.isEmpty else { return }
+
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: wordRange, actualCharacterRange: nil)
+                let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                let targetY = min(max(0, rect.minY), maxScroll)
+
+                let anchor = VoiceWordAnchor(
+                    index: anchors.count,
+                    normalizedWord: norm,
+                    stem: ScrollEngine.russianStem(for: norm),
+                    charRange: wordRange,
+                    targetScrollY: targetY
+                )
+                anchors.append(anchor)
+            }
+
+            engine.updateVoiceAnchors(anchors)
         }
 
         func displayScrollPosition(_ position: CGFloat) {
@@ -224,11 +333,11 @@ struct PrompterScrollView: UIViewRepresentable {
 
         func setManualScrollingEnabled(_ enabled: Bool) {
             textView?.isScrollEnabled = true
-            textView?.panGestureRecognizer.isEnabled = enabled
+            textView?.panGestureRecognizer.isEnabled = enabled || engine.isVoiceFollowActive
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-            if engine.isPlaying {
+            if engine.isPlaying && !engine.isVoiceFollowActive {
                 engine.pause()
             }
         }
