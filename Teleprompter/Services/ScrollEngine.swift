@@ -11,9 +11,14 @@ protocol PrompterScrollSurface: AnyObject {
 final class ScrollEngine: ObservableObject {
     @Published private(set) var isPlaying: Bool = false
     @Published private(set) var progress: Double = 0
+    @Published private(set) var remainingSeconds: Int = 0
     @Published private(set) var reachedEnd: Bool = false
 
-    var speed: Double = 75
+    var speed: Double = 75 {
+        didSet {
+            updateRemainingTime()
+        }
+    }
     weak var surface: PrompterScrollSurface?
 
     private var displayLink: CADisplayLink?
@@ -36,6 +41,7 @@ final class ScrollEngine: ObservableObject {
         self.surface = surface
         surface.setManualScrollingEnabled(!isPlaying)
         surface.displayScrollPosition(position)
+        updateRemainingTime()
     }
 
     func detach(_ surface: PrompterScrollSurface) {
@@ -140,12 +146,22 @@ final class ScrollEngine: ObservableObject {
         min(max(0, value), maxPosition)
     }
 
+    private func updateRemainingTime() {
+        let remainingDistance = max(0, maxPosition - position)
+        let effectiveSpeed = max(5.0, CGFloat(speed))
+        let seconds = Int(ceil(remainingDistance / effectiveSpeed))
+        if seconds != remainingSeconds {
+            remainingSeconds = seconds
+        }
+    }
+
     private func publishProgress(force: Bool) {
         let newProgress = maxPosition > 0 ? min(max(Double(position / maxPosition), 0), 1) : 0
         if force || abs(newProgress - lastPublishedProgress) >= 0.002 {
             lastPublishedProgress = newProgress
             progress = newProgress
         }
+        updateRemainingTime()
     }
 
     private func ensureDisplayLinkRunning() {
