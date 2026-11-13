@@ -10,7 +10,6 @@ final class PrompterContainerView: UIView {
 
     override init(frame: CGRect) {
         if #available(iOS 16.0, *) {
-            // Классический движок TextKit 1 гарантирует, что текст не пропадёт через 10 секунд
             self.textView = UITextView(usingTextLayoutManager: false)
         } else {
             self.textView = UITextView(frame: .zero)
@@ -125,7 +124,9 @@ struct PrompterScrollView: UIViewRepresentable {
         func apply(text: String, settings: PrompterSettings, force: Bool) {
             guard let textView, let containerView else { return }
 
-            let normalized = settings.normalized()
+            var normalized = settings
+            normalized.normalize()
+
             let textChanged = force || (text != lastText)
             let settingsChanged = force || (normalized != lastSettings)
 
@@ -222,7 +223,6 @@ struct PrompterScrollView: UIViewRepresentable {
         }
 
         func setManualScrollingEnabled(_ enabled: Bool) {
-            // Держим isScrollEnabled = true всегда, чтобы iOS не гасила текст во время движения
             textView?.isScrollEnabled = true
             textView?.panGestureRecognizer.isEnabled = enabled
         }
